@@ -23,6 +23,12 @@ uv run sau tencent login --account creator --headless
 uv run sau kuaishou login --account creator --headless
 ```
 
+3. vps上
+```
+.venv/bin/sau tencent login --account creator --headless
+.venv/bin/sau kuaishou login --account creator --headless
+```
+
 3. 准备 `.env`（仓库根目录）
 
 ```env
@@ -80,8 +86,45 @@ uv run sau scheduler run-once --env-file .env
 uv run sau scheduler run-daily --env-file .env
 ```
 
+### vps上运行
+```
+.venv/bin/sau scheduler run-once --env-file .env
+```
+
+启动常驻定时:
+```
+.venv/bin/sau scheduler run-daily --env-file .env
+```
+
+### systemd 常用运维命令（VPS）
+
+服务名：`sau-scheduler.service`
+
+```bash
+# 查看服务状态
+systemctl status sau-scheduler.service
+
+# 查看实时日志
+journalctl -u sau-scheduler.service -f
+
+# 重启服务
+systemctl restart sau-scheduler.service
+
+# 停止服务
+systemctl stop sau-scheduler.service
+
+# 启动服务
+systemctl start sau-scheduler.service
+
+# 开机自启
+systemctl enable sau-scheduler.service
+
+# 取消开机自启
+systemctl disable sau-scheduler.service
+```
+
 ## 常见问题
 
-- 平台 cookie 失效：重新执行对应 `login` 命令
+- 平台 cookie 失效：`scheduler` 会自动触发重新登录，并通过 Telegram 发送二维码图片，扫码后自动继续流程
 - 飞书接口报权限错误：确认应用已开通多维表与云文档下载权限，并授权到目标表格
 - Telegram 无通知：检查 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` 是否正确

@@ -69,9 +69,15 @@ class TencentVideoUploadRequest:
     collection_name: str | None = None
 
 
-async def login_tencent_account(account_name: str, headless: bool = True) -> dict:
+async def login_tencent_account(account_name: str, headless: bool = True, qrcode_callback=None) -> dict:
     account_file = resolve_account_file("tencent", account_name)
-    return await tencent_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+    return await tencent_setup(
+        str(account_file),
+        handle=True,
+        return_detail=True,
+        headless=headless,
+        qrcode_callback=qrcode_callback,
+    )
 
 
 async def check_tencent_account(account_name: str) -> bool:

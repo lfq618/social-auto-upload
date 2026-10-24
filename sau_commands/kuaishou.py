@@ -83,9 +83,15 @@ class KuaishouNoteUploadRequest:
     headless: bool = True
 
 
-async def login_kuaishou_account(account_name: str, headless: bool = True) -> dict:
+async def login_kuaishou_account(account_name: str, headless: bool = True, qrcode_callback=None) -> dict:
     account_file = resolve_account_file("kuaishou", account_name)
-    return await ks_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+    return await ks_setup(
+        str(account_file),
+        handle=True,
+        return_detail=True,
+        headless=headless,
+        qrcode_callback=qrcode_callback,
+    )
 
 
 async def check_kuaishou_account(account_name: str) -> bool:

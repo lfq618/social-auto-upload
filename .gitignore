@@ -195,3 +195,5 @@ videoFile
 
 # 本地个人使用的浏览器自动化开发 Skill，不随开源仓库发布
 /skills/browser-automation-dev/
+
+.playwright/

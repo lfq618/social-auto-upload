@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -12,6 +13,7 @@ from typing import Any
 from sau_commands.kuaishou import (
     KuaishouVideoUploadRequest,
     check_kuaishou_account,
+    login_kuaishou_account,
     upload_kuaishou_video,
 )
 from sau_commands.scheduler_config import SchedulerConfig
@@ -20,6 +22,7 @@ from sau_commands.scheduler_telegram import TelegramNotifier
 from sau_commands.tencent import (
     TencentVideoUploadRequest,
     check_tencent_account,
+    login_tencent_account,
     upload_tencent_video,
 )
 
@@ -171,25 +174,115 @@ async def publish_to_kuaishou(request: KuaishouVideoUploadRequest) -> PublishOut
 
 
 def _build_notify_text(result: RecordRunResult) -> str:
+    tencent_line = f"视频号: {result.tencent_status}" + (f" ({result.tencent_error})" if result.tencent_error else "")
+    kuaishou_line = f"快手: {result.kuaishou_status}" + (f" ({result.kuaishou_error})" if result.kuaishou_error else "")
+    summary_emoji = "✅" if result.summary_status == PUBLISHED_STATUS else "❌"
+    tencent_emoji = "✅" if result.tencent_status == PUBLISHED_STATUS else "❌"
+    kuaishou_emoji = "✅" if result.kuaishou_status == PUBLISHED_STATUS else "❌"
     base = [
-        "自动发布结果",
-        f"record_id: {result.record_id}",
-        f"视频号: {result.tencent_status}" + (f" ({result.tencent_error})" if result.tencent_error else ""),
-        f"快手: {result.kuaishou_status}" + (f" ({result.kuaishou_error})" if result.kuaishou_error else ""),
-        f"汇总: {result.summary_status}",
+        "<b>📣 自动发布结果</b>",
+        f"<b>Record</b>: <code>{html.escape(result.record_id)}</code>",
+        f"{tencent_emoji} " + (f"<b>{html.escape(tencent_line)}</b>" if result.tencent_status == FAILED_STATUS else html.escape(tencent_line)),
+        f"{kuaishou_emoji} " + (f"<b>{html.escape(kuaishou_line)}</b>" if result.kuaishou_status == FAILED_STATUS else html.escape(kuaishou_line)),
+        f"<b>{summary_emoji} 汇总</b>: {html.escape(result.summary_status)}",
     ]
     return "\n".join(base)
 
 
-async def _ensure_accounts(config: SchedulerConfig) -> None:
+def _safe_notify_text(notifier: TelegramNotifier, text: str, parse_mode: str | None = "HTML") -> None:
+    try:
+        notifier.send(text, parse_mode=parse_mode)
+    except Exception:
+        # Keep scheduler flow alive when Telegram is temporarily unavailable.
+        pass
+
+
+def _notify_login_qrcode(notifier: TelegramNotifier, platform_name: str, payload: dict[str, Any]) -> None:
+    image_path = str(payload.get("image_path") or "").strip()
+    _safe_notify_text(
+        notifier,
+        f"<b>📷 {html.escape(platform_name)} 登录二维码</b>\n"
+        "请在手机上扫码确认登录。"
+        + (f"\n二维码文件: <code>{html.escape(image_path)}</code>" if image_path else ""),
+    )
+    if not image_path:
+        return
+    try:
+        notifier.send_photo(
+            image_path,
+            caption=f"<b>{html.escape(platform_name)} 登录二维码</b>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        _safe_notify_text(
+            notifier,
+            f"<b>⚠️ {html.escape(platform_name)} 二维码图片发送失败（不中断本轮）</b>\n"
+            f"{html.escape(str(exc))}",
+        )
+
+
+def _update_status_fields_with_fallback(
+    feishu: FeishuBitableClient,
+    record_id: str,
+    field_values: dict[str, Any],
+) -> list[str]:
+    """Try bulk update first; if a field name is missing, degrade to per-field updates."""
+    try:
+        feishu.update_record_fields(record_id, field_values)
+        return []
+    except Exception as exc:
+        if "FieldNameNotFound" not in str(exc):
+            raise
+
+    missing_fields: list[str] = []
+    for field_name, field_value in field_values.items():
+        try:
+            feishu.update_record_fields(record_id, {field_name: field_value})
+        except Exception as exc:
+            if "FieldNameNotFound" in str(exc):
+                missing_fields.append(field_name)
+                continue
+            raise
+    return missing_fields
+
+
+async def _ensure_accounts(config: SchedulerConfig, notifier: TelegramNotifier) -> None:
     tencent_valid, kuaishou_valid = await asyncio.gather(
         check_tencent_account(config.tencent_account),
         check_kuaishou_account(config.kuaishou_account),
     )
+
     if not tencent_valid:
-        raise RuntimeError(f"Tencent account invalid: {config.tencent_account}")
+        _safe_notify_text(
+            notifier,
+            f"<b>⚠️ 视频号登录态失效</b>\n开始自动拉起登录流程: <code>{html.escape(config.tencent_account)}</code>",
+        )
+        result = await login_tencent_account(
+            config.tencent_account,
+            headless=config.headless,
+            qrcode_callback=lambda payload: _notify_login_qrcode(notifier, "视频号", payload),
+        )
+        if not result.get("success"):
+            message = str(result.get("message") or "unknown error")
+            _safe_notify_text(notifier, f"<b>❌ 视频号自动登录失败</b>\n{html.escape(message)}")
+            raise RuntimeError(f"Tencent account relogin failed: {config.tencent_account}, {message}")
+        _safe_notify_text(notifier, f"<b>✅ 视频号自动登录成功</b>\n账号: <code>{html.escape(config.tencent_account)}</code>")
+
     if not kuaishou_valid:
-        raise RuntimeError(f"Kuaishou account invalid: {config.kuaishou_account}")
+        _safe_notify_text(
+            notifier,
+            f"<b>⚠️ 快手登录态失效</b>\n开始自动拉起登录流程: <code>{html.escape(config.kuaishou_account)}</code>",
+        )
+        result = await login_kuaishou_account(
+            config.kuaishou_account,
+            headless=config.headless,
+            qrcode_callback=lambda payload: _notify_login_qrcode(notifier, "快手", payload),
+        )
+        if not result.get("success"):
+            message = str(result.get("message") or "unknown error")
+            _safe_notify_text(notifier, f"<b>❌ 快手自动登录失败</b>\n{html.escape(message)}")
+            raise RuntimeError(f"Kuaishou account relogin failed: {config.kuaishou_account}, {message}")
+        _safe_notify_text(notifier, f"<b>✅ 快手自动登录成功</b>\n账号: <code>{html.escape(config.kuaishou_account)}</code>")
 
 
 async def process_one_record(
@@ -227,7 +320,8 @@ async def process_one_record(
         kuaishou_error=kuaishou_outcome.error,
     )
 
-    feishu.update_record_fields(
+    missing_fields = _update_status_fields_with_fallback(
+        feishu,
         record_id,
         {
             config.tencent_status_field: result.tencent_status,
@@ -235,7 +329,15 @@ async def process_one_record(
             config.summary_status_field: result.summary_status,
         },
     )
-    notifier.send(_build_notify_text(result))
+    if missing_fields:
+        _safe_notify_text(
+            notifier,
+            "<b>⚠️ 状态回写字段缺失</b>\n"
+            f"<b>Record</b>: <code>{html.escape(record_id)}</code>\n"
+            f"缺失字段: {html.escape(', '.join(missing_fields))}\n"
+            "已自动跳过缺失字段，其余字段正常回写。"
+        )
+    _safe_notify_text(notifier, _build_notify_text(result))
     return result
 
 
@@ -258,7 +360,7 @@ async def run_once(config: SchedulerConfig) -> RunSummary:
         bot_token=config.telegram_bot_token,
         chat_id=config.telegram_chat_id,
     )
-    await _ensure_accounts(config)
+    await _ensure_accounts(config, notifier)
 
     records = feishu.list_records()
     today = datetime.now(config.timezone).date()
@@ -286,14 +388,15 @@ async def run_once(config: SchedulerConfig) -> RunSummary:
             failed_count += 1
             record_id = str(record.get("record_id") or "unknown")
             message = (
-                "自动发布结果\n"
-                f"record_id: {record_id}\n"
-                f"错误: {exc}\n"
-                f"traceback: {traceback.format_exc(limit=1)}"
+                "<b>❌ 自动发布结果</b>\n"
+                f"<b>Record</b>: <code>{html.escape(record_id)}</code>\n"
+                f"<b>错误</b>: {html.escape(str(exc))}\n"
+                f"<b>Traceback</b>:\n<pre>{html.escape(traceback.format_exc(limit=1))}</pre>"
             )
-            notifier.send(message)
+            _safe_notify_text(notifier, message)
             try:
-                feishu.update_record_fields(
+                _update_status_fields_with_fallback(
+                    feishu,
                     record_id,
                     {
                         config.tencent_status_field: FAILED_STATUS,
@@ -310,16 +413,17 @@ async def run_once(config: SchedulerConfig) -> RunSummary:
         success_records=success_count,
         failed_records=failed_count,
     )
-    notifier.send(
+    _safe_notify_text(
+        notifier,
         "\n".join(
             [
-                "自动发布批次完成",
-                f"扫描记录: {summary.scanned_records}",
-                f"命中记录: {summary.processed_records}",
-                f"成功: {summary.success_records}",
-                f"失败: {summary.failed_records}",
+                "<b>📦 自动发布批次完成</b>",
+                f"扫描记录: <b>{summary.scanned_records}</b>",
+                f"命中记录: <b>{summary.processed_records}</b>",
+                f"✅ 成功: <b>{summary.success_records}</b>",
+                f"❌ 失败: <b>{summary.failed_records}</b>",
             ]
-        )
+        ),
     )
     return summary
 

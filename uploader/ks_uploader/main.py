@@ -534,6 +534,64 @@ class KSVideo(KSBaseUploader):
         self.thumbnail_path = thumbnail_path
         self.desc = desc or ""
         self.collection_name = collection_name
+        # 快手发布页「作者声明」默认选含 AI 生成（与项目其它平台合规策略一致）
+        self.author_declaration = "含AI生成内容"
+
+    async def apply_author_declaration(self, page: Page) -> None:
+        """在发布表单勾选「作者声明」为 AI 生成内容。
+
+        发布页有多个 ant-select（合集/热点/声明等），用 label「作者声明」锚定，避免误点其它下拉。
+        """
+        declaration = getattr(self, "author_declaration", None) or "含AI生成内容"
+        option_candidates = [declaration, "含AI生成内容", "内容为AI生成", "AI生成内容"]
+        try:
+            trigger = page.locator('label:text-is("作者声明")').locator(
+                "xpath=following-sibling::div[contains(@class,'ant-select')]"
+            ).first
+            if await trigger.count() == 0:
+                # 部分版本为单选组而非下拉
+                for text in option_candidates:
+                    radio = page.locator("label.ant-radio-wrapper", has_text=text).first
+                    if await radio.count():
+                        await radio.click(timeout=8000)
+                        kuaishou_logger.success(_msg("🏷️", f"作者声明已选择：{text}"))
+                        return
+                kuaishou_logger.warning(_msg("😵", "未找到「作者声明」控件，跳过"))
+                return
+
+            await trigger.locator(".ant-select-selector").click(timeout=8000)
+            await page.wait_for_timeout(800)
+
+            selected = False
+            for text in option_candidates:
+                option = page.locator(f'div.ant-select-item-option[label="{text}"]')
+                if await option.count():
+                    await option.first.click(timeout=8000)
+                    selected = True
+                    declaration = text
+                    break
+                option = page.locator("div.ant-select-item-option-content", has_text=text)
+                if await option.count():
+                    await option.first.click(timeout=8000)
+                    selected = True
+                    declaration = text
+                    break
+
+            if not selected:
+                await page.keyboard.press("Escape")
+                kuaishou_logger.warning(
+                    _msg("😵", f"作者声明下拉未找到「{declaration}」等选项，保持未选状态")
+                )
+                return
+
+            await page.wait_for_timeout(500)
+            kuaishou_logger.success(_msg("🏷️", f"作者声明已选择：{declaration}"))
+        except Exception as exc:
+            kuaishou_logger.warning(_msg("😵", f"选择作者声明失败，跳过继续发布: {exc}"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
 
     async def apply_collection(self, page: Page) -> None:
         """在发布表单页选择"加入合集"下拉框（Ant Design Select，label 属性=合集名）。
@@ -704,6 +762,8 @@ class KSVideo(KSBaseUploader):
             await self.set_thumbnail(page)
 
             await self.apply_collection(page)
+
+            await self.apply_author_declaration(page)
 
             if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
                 await self.set_schedule_time(page, self.publish_date)
